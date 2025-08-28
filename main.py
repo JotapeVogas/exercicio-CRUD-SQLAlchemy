@@ -1,12 +1,25 @@
+from contextlib import contextmanager
+from typing import Iterator
+import json
+
+from fastapi.exceptions import HTTPException
+from fastapi.responses import JSONResponse
 from fastapi import FastAPI, HTTPException, status, Query, Body, Path, Form, Depends
 from fastapi.responses import Response
-from pydantic import BaseModel, EmailStr, Field
-from typing import Optional, List
+
+from sqlalchemy.orm import selectinload, with_loader_criteria
 from sqlalchemy import create_engine, Column, Integer, String, Boolean
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy import Column, Integer, String
+
+from pydantic import BaseModel, EmailStr, Field
+
+from typing import Optional, List
+
 from dotenv import load_dotenv
+
 import os
 
 load_dotenv()
@@ -32,8 +45,8 @@ class UsuarioDB(Base):
 # Criar tabelas
 Base.metadata.create_all(bind=engine)
 
-# Dependência para obter sessão do banco
-def get_db():
+@contextmanager
+def Database() -> Iterator[Session]:
     db = SessionLocal()
     try:
         yield db
@@ -42,15 +55,13 @@ def get_db():
 
 # Modelos Pydantic
 class UsuarioBase(BaseModel):
+    id: Optional[int] = None
+
+class SetUser(UsuarioBase):
     nome: str
     email: EmailStr
-    ativo: int
-
-class UsuarioCreate(UsuarioBase):
+    ativo: int = Field(default=1, description="1: ativo | 0: inativo")
     pass
-
-class Usuario(UsuarioBase):
-    id: int
 
     class Config:
         from_attributes = True
@@ -58,7 +69,7 @@ class Usuario(UsuarioBase):
 # # CRUD com SQLAlchemy
 # class UsuarioCRUD:
 #     @staticmethod
-#     def criar(db: Session, usuario: UsuarioCreate):
+#     def criar(db: Session, usuario: SetUser):
 #         try:
 #             db_usuario = UsuarioDB(**usuario.dict())
 #             db.add(db_usuario)
@@ -97,7 +108,7 @@ class Usuario(UsuarioBase):
 #         return query.all()
 
 #     @staticmethod
-#     def atualizar(db: Session, usuario_id: int, usuario: UsuarioCreate):
+#     def atualizar(db: Session, usuario_id: int, usuario: SetUser):
 #         try:
 #             db_usuario = db.query(UsuarioDB).filter(UsuarioDB.id == usuario_id).first()
 #             if not db_usuario:
@@ -139,28 +150,32 @@ def home():
 
 @app.post("/usuarios", 
           status_code=status.HTTP_201_CREATED,
-          response_model=Usuario,
+          response_model=SetUser,
           summary="Criar novo usuário",
           description="Cadastra um novo usuário no sistema.",
           responses={
               201: {"description": "Usuário criado com sucesso"},
               400: {"description": "Dados inválidos ou erro no banco de dados"}
           })
-def criar_usuario(
-    usuario: UsuarioCreate,
-    db: Session = Depends(get_db)
-):
+def criar_usuario(user_info: SetUser = Body(...)):
     try:
-        novo_usuario = UsuarioCRUD.criar(db, usuario)
-        return novo_usuario
-    except SQLAlchemyError as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Erro ao criar usuário: {str(e)}"
-        )
+        new_user = UsuarioDB(**user_info.dict(exclude={"id"}))
+        with Database() as banco:
+            banco.add(new_user)
+            banco.flush()
+            banco.refresh(new_user)
+            if new_user.id:
+                 user_info.id = new_user.id
+            banco.commit()
+        return JSONResponse(json.loads(user_info.model_dump_json()), 201)
+    except Exception as E:
+        if isinstance(E, HTTPException):
+            raise E
+        else:
+            raise HTTPException(400, str(E))
 
 @app.get("/usuarios",
-    response_model=List[Usuario],
+    response_model=List[SetUser],
     summary="Listar usuários",
     description="""Retorna todos os usuários cadastrados. 
                 Pode ser filtrado por nome quando fornecido como parâmetro.""",
@@ -169,21 +184,48 @@ def criar_usuario(
         404: {"description": "Nenhum usuário encontrado"}
     })
 def listar_usuarios(
-    ativo: Optional[int] = Query(default=None, description="1: só ativos | 0: só inativos | -1: ativos e inativos"),
-    nome: Optional[str] = Query(default=None, description="Filtrar por nome"),
-    ordenador: Optional[str] = Query(default="id", description="Ordernar por campos nome, id ou email"),
-    db: Session = Depends(get_db)
+    id: Optional[int] = Query(None, description="Filtrar por ID"),
+    ativo: Optional[int] = Query(default=-1, description="1: só ativos | 0: só inativos | -1: ativos e inativos"),
+    nome: Optional[str] = Query(default="", description="Filtrar por nome"),
+    ordenador: Optional[str] = Query(default="id", description="Ordernar por campos nome, id e ativo", )
 ):
-    usuarios = UsuarioCRUD.listar_com_filtro(db, ativo, nome, ordenador)
-    if not usuarios:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Nenhum usuário encontrado"
-        )
-    return usuarios
+    try:
+        with Database() as banco:
+            query = banco.query(UsuarioDB)
 
-@app.patch("/usuarios/{usuario_id}",
-         response_model=Usuario,
+            if ativo is not None and ativo != -1:
+                query = query.filter(UsuarioDB.ativo == ativo)
+            elif ativo == -1:
+                query = query.filter(UsuarioDB.ativo.in_([0, 1]))
+
+            if id is not None:
+                query = query.filter(UsuarioDB.id == id)
+
+            if nome:
+                query = query.filter(UsuarioDB.nome.ilike(f"%{nome.strip()}%"))
+
+            colunas_permitidas = {
+                "id": UsuarioDB.id,
+                "nome": UsuarioDB.nome,
+                "ativo": UsuarioDB.ativo
+            }
+            coluna_ordenacao = colunas_permitidas.get(ordenador, UsuarioDB.id)
+            query = query.order_by(coluna_ordenacao.asc())
+
+            db_users = query.all()
+
+            if not db_users:
+                raise HTTPException(status_code=404, detail="Nenhum usuário encontrado")
+            
+            return db_users
+    except Exception as E:
+        if isinstance(E, HTTPException):
+            raise E
+        else:
+            raise HTTPException(400, str(E))
+
+@app.patch("/usuarios",
+         response_model=SetUser,
          summary="Atualizar usuário",
          description="Atualiza os dados de um usuário existente pelo seu ID.",
          responses={
@@ -191,38 +233,27 @@ def listar_usuarios(
              400: {"description": "Dados inválidos"},
              404: {"description": "Usuário não encontrado"}
          })
-def atualizar_usuario(
-    usuario_id: int = Path(..., title="ID do usuário"),
-    usuario: UsuarioCreate = Body(..., title="Dados do usuário para atualização"),
-    db: Session = Depends(get_db)
+def atualizar_usuario(user_info: SetUser = Body(..., title="Dados do usuário para atualização")
 ):
     try:
-        usuario_existente = UsuarioCRUD.buscar_por_id(db, usuario_id)
-        if not usuario_existente:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Usuário não encontrado"
+        with Database() as banco:
+            db_user = banco.query(UsuarioDB).filter(
+                UsuarioDB.id == user_info.id
+            ).update(
+                user_info.model_dump(exclude_unset=True, exclude={"id"})
             )
-        
-        usuario_atualizado = UsuarioCRUD.atualizar(db, usuario_id, usuario)
-        
-        if not usuario_atualizado:   
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Falha ao atualizar usuário no banco de dados"
-            )
-                   
-        return usuario_atualizado
-            
-    except HTTPException:
-        raise
-    except SQLAlchemyError as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Erro ao atualizar usuário: {str(e)}"
-        )
+            if db_user:
+                banco.commit()
+            else:
+                raise HTTPException(404, 'Usuário já cadastrado')
+        return JSONResponse(json.loads(user_info.model_dump_json()), 200)
+    except Exception as E:
+        if isinstance(E, HTTPException):
+            raise E
+        else:
+            raise HTTPException(400, str(E))
 
-@app.delete("/usuarios/{usuario_id}", 
+@app.delete("/usuarios", 
             status_code=status.HTTP_204_NO_CONTENT,
             summary="Desativar usuário",
             description="Exclui logicamente um usuário do sistema pelo seu ID.",
@@ -231,19 +262,26 @@ def atualizar_usuario(
                 404: {"description": "Usuário não encontrado"},
                 500: {"description": "Erro interno no servidor"}
             })
-def deletar_usuario(
-    usuario_id: int = Path(..., title="ID do usuário", description="ID do usuário a ser removido"),
-    db: Session = Depends(get_db)
-):
-    usuario = UsuarioCRUD.buscar_por_id(db, usuario_id)
-    if not usuario:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Usuário não encontrado"
-        )
-    
-    UsuarioCRUD.deletar(db, usuario_id)
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
+def deletar_usuario(user_info: UsuarioBase = Body(..., title="Dados do usuário para atualização")):
+    try:
+        with Database() as banco:
+            usuario = banco.query(UsuarioDB).filter(
+                UsuarioDB.id == user_info.id
+            ).update(
+                {"ativo": 0}
+            )
+            if not usuario:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Usuário não encontrado"
+                )
+            banco.commit()
+        return JSONResponse(json.loads(user_info.model_dump_json()), 200)
+    except Exception as E:
+        if isinstance(E, HTTPException):
+            raise E
+        else:
+            raise HTTPException(400, str(E))
 
 if __name__ == "__main__":
     import uvicorn
