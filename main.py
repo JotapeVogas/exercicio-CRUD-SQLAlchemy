@@ -116,15 +116,15 @@ def get_users(
         with Database() as banco:
             query = banco.query(UsuarioDB)
 
-            if ativo is not None and ativo != -1:
+            if ordenador == "ativo" and ativo is not None and ativo != -1:
                 query = query.filter(UsuarioDB.ativo == ativo)
             elif ativo == -1:
                 query = query.filter(UsuarioDB.ativo.in_([0, 1]))
 
-            if id is not None:
+            if ordenador == "id" and id is not None:
                 query = query.filter(UsuarioDB.id == id)
 
-            if nome:
+            if ordenador == "nome" and nome:
                 query = query.filter(UsuarioDB.nome.ilike(f"%{nome.strip()}%"))
 
             colunas_permitidas = {
