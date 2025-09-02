@@ -14,7 +14,7 @@ from sqlalchemy.orm import sessionmaker, Session
 
 from pydantic import BaseModel, EmailStr, Field
 
-from typing import Optional, List
+from typing import Optional, List, Literal
 
 from dotenv import load_dotenv
 
@@ -108,31 +108,26 @@ def set_user(user_info: SetUser = Body(...)):
     })
 def get_users(
     id: Optional[int] = Query(None, description="Filtrar por ID"),
-    ativo: Optional[int] = Query(default=-1, description="1: só ativos | 0: só inativos | -1: ativos e inativos"),
+    ativo: Literal["-1", "0", "1"] = Query(-1, description="-1: todos | 0: inativos | 1: ativos"),
     nome: Optional[str] = Query(default="", description="Filtrar por nome"),
-    ordenador: Optional[str] = Query(default="id", description="Ordernar por campos nome, id e ativo", )
+    ordenador: Literal["id", "nome", "ativo"] = Query(default="id")
 ):
     try:
         with Database() as banco:
             query = banco.query(UsuarioDB)
 
-            if ordenador == "ativo" and ativo is not None and ativo != -1:
+            if ordenador == "ativo" and ativo == "0" or ativo == "1":
                 query = query.filter(UsuarioDB.ativo == ativo)
-            elif ativo == -1:
+            elif ativo == "-1":
                 query = query.filter(UsuarioDB.ativo.in_([0, 1]))
 
-            if ordenador == "id" and id is not None:
+            if ordenador == "id" and id > 0:
                 query = query.filter(UsuarioDB.id == id)
 
             if ordenador == "nome" and nome:
                 query = query.filter(UsuarioDB.nome.ilike(f"%{nome.strip()}%"))
 
-            colunas_permitidas = {
-                "id": UsuarioDB.id,
-                "nome": UsuarioDB.nome,
-                "ativo": UsuarioDB.ativo
-            }
-            coluna_ordenacao = colunas_permitidas.get(ordenador, UsuarioDB.id)
+            coluna_ordenacao = getattr(UsuarioDB, ordenador)
             query = query.order_by(coluna_ordenacao.asc())
 
             db_users = query.all()
